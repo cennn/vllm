@@ -16,7 +16,7 @@ sampling_params = SamplingParams(
 
 # Create an LLM.
 llm = LLM(
-    model="deepseek-ai/DeepSeek-V2-Lite-Chat",
+    model="deepseek-ai/DeepSeek-V2-Lite",
     # model="deepseek-ai/DeepSeek-V2.5",
     tensor_parallel_size=1,
     trust_remote_code=True,

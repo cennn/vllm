@@ -15,7 +15,7 @@ except ImportError:
     FLASHINFER_WORKSPACE_BUFFER_SIZE = 0
 
 import torch
-from vllm_flash_attn import flash_attn_varlen_func
+from vllm.vllm_flash_attn import flash_attn_varlen_func
 
 from vllm import _custom_ops as ops
 from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
@@ -202,7 +202,7 @@ class FlashInferMLAMetadata(AttentionMetadata):
     device: torch.device = torch.device("cuda")
     is_profile_run: bool = False
 
-    sm_scale: float = 0.0
+    # sm_scale: float = 0.0
     extras: Dict[str, torch.Tensor] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -215,8 +215,8 @@ class FlashInferMLAMetadata(AttentionMetadata):
 
         # Note(simon): for MLA: soft max scale needs to be
         # `1 / sqrt(qk_nope_head_dim + qk_rope_head_dim)`.
-        assert self.head_dim is not None
-        self.sm_scale = 1.0 / math.sqrt(self.head_dim + self.head_dim // 8)
+        # assert self.head_dim is not None
+        # self.sm_scale = 1.0 / math.sqrt(self.head_dim + self.head_dim // 8)
 
     def begin_forward(self):
         if self.num_prefill_tokens > 0:
@@ -245,7 +245,7 @@ class FlashInferMLAMetadata(AttentionMetadata):
                 self.num_qo_heads,
                 self.head_dim,
                 self.page_size,
-                sm_scale=self.sm_scale,
+                sm_scale=0, # will be overwritten by the impl
                 data_type=self.data_type,
                 q_data_type=self.q_data_type)
 
@@ -717,4 +717,142 @@ class FlashInferMLAImpl(AttentionImpl):
             paged_ckv_cache=kv_cache[:, 0],
             paged_kpe_cache=kv_cache[:, 1],
         )
+
+        # load cache
+        paged_kv_indptr = decode_meta.paged_kv_indptr
+        paged_kv_indices = decode_meta.paged_kv_indices
+        paged_kv_last_page_len = decode_meta.paged_kv_last_page_len
+
+        def gather_paged_kv(
+            kv_cache: torch.Tensor,
+            paged_kv_indices: torch.Tensor,
+            paged_kv_indptr: torch.Tensor,
+            paged_kv_last_page_len: torch.Tensor,
+        ):
+            """
+            kv_cache: shape (num_blocks, 2, block_size, num_heads, head_dim)
+            paged_kv_indices: shape [total_blocks_across_batch]
+            paged_kv_indptr:  shape [batch_size + 1]
+            paged_kv_last_page_len: shape [batch_size]
+            Returns:
+            K_out, V_out with shape (batch_size, max_kv_len, num_heads, head_dim)
+            """
+            num_blocks, two_, block_size, num_heads, head_dim = kv_cache.shape
+            assert two_ == 2, "kv_cache shape must be (num_blocks, 2, block_size, num_heads, head_dim)"
+
+            batch_size = paged_kv_indptr.shape[0] - 1
+            device = kv_cache.device
+            dtype = kv_cache.dtype
+
+            # -------------------------------------------------------------------------
+            # 1. Compute the maximum number of tokens (max_kv_len) across all requests
+            # -------------------------------------------------------------------------
+            max_kv_len = 0
+            for b in range(batch_size):
+                # The block indices for request b
+                start = paged_kv_indptr[b]
+                end = paged_kv_indptr[b + 1]
+                num_full_blocks = (end - start) - 1  # all but the last block
+                total_tokens = num_full_blocks * block_size + paged_kv_last_page_len[
+                    b]
+                max_kv_len = max(max_kv_len, total_tokens)
+
+            # -------------------------------------------------------------------------
+            # 2. Allocate the output buffers for K and V
+            #    Shape: (batch_size, max_kv_len, num_heads, head_dim)
+            # -------------------------------------------------------------------------
+            K_out = torch.zeros(
+                (batch_size, max_kv_len, num_heads, head_dim),
+                device=device,
+                dtype=dtype,
+            )
+            V_out = torch.zeros_like(K_out)  # same shape & dtype as K_out
+
+            # -------------------------------------------------------------------------
+            # 3. Copy each request’s blocks from kv_cache into [K_out, V_out]
+            # -------------------------------------------------------------------------
+            for b in range(batch_size):
+                start = paged_kv_indptr[b]
+                end = paged_kv_indptr[b + 1]
+                block_indices_for_b = paged_kv_indices[start:end]
+
+                # We'll copy blocks sequentially into K_out[b, ...], V_out[b, ...]
+                copy_pos = 0
+                num_blocks_b = len(block_indices_for_b)
+
+                # Go through each block index
+                for i, block_idx in enumerate(block_indices_for_b):
+                    # For all but the last block, copy the entire block_size.
+                    # For the last block, only copy 'paged_kv_last_page_len[b]' entries
+                    if i < (num_blocks_b - 1):
+                        # Copy entire block
+                        K_block = kv_cache[
+                            block_idx,
+                            0]  # shape (block_size, num_heads, head_dim)
+                        V_block = kv_cache[block_idx, 1]
+                        K_out[b, copy_pos:copy_pos + block_size] = K_block
+                        V_out[b, copy_pos:copy_pos + block_size] = V_block
+                        copy_pos += block_size
+                    else:
+                        # Last block for this request
+                        last_len = paged_kv_last_page_len[b].item()
+                        if last_len > 0:
+                            K_block = kv_cache[
+                                block_idx,
+                                0][:
+                                   last_len]  # shape (last_len, num_heads, head_dim)
+                            V_block = kv_cache[block_idx, 1][:last_len]
+                            K_out[b, copy_pos:copy_pos + last_len] = K_block
+                            V_out[b, copy_pos:copy_pos + last_len] = V_block
+                        # If last_len == 0, we simply skip copying
+                        copy_pos += last_len
+
+            return K_out, V_out
+
+        debug = False
+        if debug:
+            K_out, V_out = gather_paged_kv(kv_cache, paged_kv_indices,
+                                           paged_kv_indptr,
+                                           paged_kv_last_page_len)
+
+            # debug: hand implemented MLA, this not correct yet, please fix it
+            q_pe = decode_query_pe  # [bsz, num_heads, qk_rope_head_dim]
+            k_pe_cache = V_out[:, :, 0, :self.head_size //
+                               8]  # [bsz, kv_len, rope_head_dim]
+
+            attn_weights_pe = torch.matmul(
+                q_pe,  # [bsz, num_heads, qk_rope_head_dim]
+                k_pe_cache.transpose(
+                    1, 2
+                )  # [bsz, kv_len, 64] view(bsz, kv_len, self.qk_rope_head_dim)
+            )
+
+            q_nope = decode_query_nope  # [bsz, num_heads, latent_dim]
+            compressed_kv_normed_cache = K_out.squeeze(
+                2)  # [bsz, kv_len, latent_dim]
+
+            # attn_weights_nope ~ [bsz, num_heads, kv_len]
+            attn_weights_nope = torch.matmul(
+                q_nope,  # [bsz, 128, 512]
+                compressed_kv_normed_cache.transpose(
+                    1, 2)  # view(bsz, kv_len, 512)
+            )
+
+            attn_weights = (attn_weights_pe + attn_weights_nope) * self.scale
+
+            attn_weights = torch.nn.functional.softmax(attn_weights,
+                                                       dim=-1,
+                                                       dtype=torch.float32).to(
+                                                           q_nope.dtype)
+
+            # attn_output ~ {attn_output.shape}") # [bsz, 128, 512]
+            attn_output = torch.matmul(
+                attn_weights,  # [bsz, 128, kv_len]
+                compressed_kv_normed_cache  # [bsz, kv_len, 512]
+            )
+
+            return attn_output
+
+        # diff = attn_output - decode_output
+        # print(f"diff: {diff.abs().sum()}")
         return decode_output
